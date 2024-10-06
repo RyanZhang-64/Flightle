@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SVG Viewer with Pan and Zoom</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Jost:ital,wght@0,100..900;1,100..900&display=swap');
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            font-family: Jost, sans-serif;
+        }
+        #svg-container {
+            width: 100%;
+            height: 100%;
+            display: block; /* Ensures there are no extra spaces around the SVG */
+        }
+        #svg-container svg {
+            transform: translate3d(0, 0, 0); /* Encourage GPU layer */
+        }
+
+        @keyframes tooltip-spring-in {
+            0% {
+                transform: scale(0.6) translateY(10px);
+                opacity: 0;
+            }
+            50% {
+                transform: scale(1.1) translateY(-5px);
+                opacity: 1;
+            }
+            100% {
+                transform: scale(1) translateY(0);
+                opacity: 1;
+            }
+        }
+
+        @keyframes tooltip-retract {
+            0% {
+                transform: scale(1) translateY(0);
+                opacity: 1;
+            }
+            100% {
+                transform: scale(0.8) translateY(10px);
+                opacity: 0;
+            }
+        }
+
+        
+        .marker-tooltip {
+            position: absolute;
+            background: white;
+            border: 1px solid #333;
+            padding: 2px;
+            border-radius: 4px;
+            font-size: 5px;
+            font-family: Arial, sans-serif;
+            color: #333;
+            pointer-events: none;
+            opacity: 0;
+            transform-origin: bottom center;
+            animation: tooltip-spring-in 0.3s ease-out forwards;
+            
+            max-width: 150px;
+            text-align: center;
+        }
+
+        .marker-tooltip.hiding {
+            animation: tooltip-retract 0.2s ease-in forwards;
+        }
+
+        .marker-tooltip::after {
+            content: "";
+            position: absolute;
+            bottom: -6px;
+            left: 50%;
+            transform: translateX(-50%);
+            border-width: 3px;
+            border-style: solid;
+            border-color: white transparent transparent transparent;
+        }
+
+        .marker-tooltip::before {
+            content: "";
+            position: absolute;
+            bottom: -7px;
+            left: 50%;
+            transform: translateX(-50%);
+            border-width: 3px;
+            border-style: solid;
+            border-color: #333 transparent transparent transparent;
+        }
+    </style>
+</head>
+<body>
+    <div id="svg-container"></div>
+
+    <script>
+        const svgWidth = 360;
+        const svgHeight = 180;
+        let [depatureLat, departureLon] = [51.874699, -0.368333];
+        const animationTime = 2000;
+        const bezierFunction = 'cubic-bezier(0.4, 0.0, 0.2, 1)';
+        const easeCubicBezier = cubicBezier(0.4, 0.0, 0.2, 1);
+        const sizeCubicBezier = cubicBezier(0.4, 0.0, 0.2, 1);
+        const markerRadius = 0.5;
+        const airplaneSize = 10;
+
+        let csvText;
+        let svg;
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            try {
+                const container = document.getElementById('svg-container');
+
+                const svgResponse = await fetch('world.svg');
+                const svgContent = await svgResponse.text();
+                container.innerHTML = svgContent;
+                svg = container.querySelector('svg');
+                svg.setAttribute('width', '100%');
+                svg.setAttribute('height', '100%');
+                setupPanZoom();
+
+                const csvResponse = await fetch('output.csv');
+                if (!csvResponse.ok) {
+                    throw new Error('Network response was not ok for CSV data');
+                }
+                csvText = await csvResponse.text();
+                await highlightRoutes('EGGW');
+
+            } catch (error) {
+                console.error('Error loading resources:', error);
+                document.getElementById('csv-output').innerHTML = 'Failed to load data.';
+            }
+        });
+
+        let currentRouteGroup = null;
+
+        async function highlightRoutes(departureIcao) {
+            try {
+                // Clear any existing routes
+                clearHighlightedRoutes();
+
+                // Create a new group for this set of routes
+                currentRouteGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
+                currentRouteGroup.setAttribute('id', 'route-highlights');
+                svg.appendChild(currentRouteGroup);
+
+                const arrivalIcaos = await fetchRoutes(departureIcao);
+                const relevantCsvData = findRelevantCsvData(arrivalIcaos);
+                
+                relevantCsvData.forEach(data => {
+                    const [icao, name, latStr, lonStr] = data.split(','); // Assuming data is 'lat,lon'
+                    lat = Number(latStr);
+                    lon = Number(lonStr);
+                    console.log(lat, lon);
+                    createMarker(icao, name, lat, lon, currentRouteGroup, svg);
+                    
+                    // If you're also creating paths, you can add them to the group as well:
+                    // createPath(depatureLat, departureLon, lat, lon, currentRouteGroup);
+                });
+                
+            } catch (error) {
+                console.error('Error in highlighting routes:', error);
+            }
+        }
+
+        function clearHighlightedRoutes() {
+            if (currentRouteGroup && currentRouteGroup.parentNode) {
+                currentRouteGroup.parentNode.removeChild(currentRouteGroup);
+            }
+            currentRouteGroup = null;
+        }
+
+        async function fetchRoutes(departureIcao) {
+            const apiKey = 'a5e86f-01cc25'; // Remember to protect your API key in production environments
+            const url = `https://aviation-edge.com/v2/public/routes?key=${apiKey}&departureIcao=${departureIcao}`;
+
+            console.log(departureIcao);
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            const jsonData = await response.json();
+            return logUniqueColumn(jsonData, 'arrivalIcao');
+        }
+
+        function logUniqueColumn(jsonData, columnKey) {
+            const uniqueEntries = new Set();
+            console.log(jsonData);
+            jsonData.forEach(item => {
+                if (item[columnKey]) {
+                    uniqueEntries.add(item[columnKey]);
+                }
+            });
+            return uniqueEntries;
+        }
+
+        function findRelevantCsvData(uniqueIcaos) {
+            const uniqueData = new Set();
+            const lines = csvText.split(/\r\n|\n/);
+            const icaoIndex = 1; // Index of ICAO in CSV (2nd column)
+            const nameIndex = 3;
+            const latIndex = 4; // Index for the 5th column
+            const lonIndex = 5; // Index for the 6th column
+
+            // Skip header by starting from index 1
+            for (let i = 1; i < lines.length; i++) {
+                const columns = parseCSVLine(lines[i]);
+                if (columns.length > lonIndex) {
+                    const csvIcao = columns[icaoIndex].trim();
+                    if (uniqueIcaos.has(csvIcao)) {
+                        const data = `${csvIcao}, ${columns[nameIndex].trim()}, ${columns[latIndex].trim()}, ${columns[lonIndex].trim()}`;
+                        uniqueData.add(data);
+                    }
+                }
+            }
+            return uniqueData;
+        }
+
+        function parseCSVLine(line) {
+            const result = [];
+            let startIndex = 0;
+            let inQuotes = false;
+
+            for (let i = 0; i < line.length; i++) {
+                if (line[i] === '"') {
+                    inQuotes = !inQuotes;
+                } else if (line[i] === ',' && !inQuotes) {
+                    result.push(line.substring(startIndex, i).trim().replace(/^"|"$/g, ''));
+                    startIndex = i + 1;
+                }
+            }
+
+            // Push the last field
+            result.push(line.substring(startIndex).trim().replace(/^"|"$/g, ''));
+
+            return result;
+        }
+
+
+        function haversine(lat1, lon1, lat2, lon2) {
+            function toRadians(degree) {
+                return degree * Math.PI / 180;
+            }
+
+            const R = 6371; // Earth's radius in kilometers
+            const dLat = toRadians(lat2 - lat1);
+            const dLon = toRadians(lon2 - lon1);
+            lat1 = toRadians(lat1);
+            lat2 = toRadians(lat2);
+
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                    Math.cos(lat1) * Math.cos(lat2) *
+                    Math.sin(dLon/2) * Math.sin(dLon/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+            return R * c; // Distance in kilometers
+        }
+
+        function createPath(lat1, lon1, lat2, lon2, svg) {
+            function toRadians(degrees) {
+                return degrees * Math.PI / 180;
+            }
+
+            function interpolateGreatCircle(lat1, lon1, lat2, lon2, fraction) {
+                const φ1 = toRadians(lat1), λ1 = toRadians(lon1);
+                const φ2 = toRadians(lat2), λ2 = toRadians(lon2);
+
+                const delta = λ2 - λ1;
+                const a = Math.sin((1 - fraction) * delta) / Math.sin(delta);
+                const b = Math.sin(fraction * delta) / Math.sin(delta);
+                const x = a * Math.cos(φ1) * Math.cos(λ1) + b * Math.cos(φ2) * Math.cos(λ2);
+                const y = a * Math.cos(φ1) * Math.sin(λ1) + b * Math.cos(φ2) * Math.sin(λ2);
+                const z = a * Math.sin(φ1) + b * Math.sin(φ2);
+
+                const φ3 = Math.atan2(z, Math.sqrt(x * x + y * y));
+                const λ3 = Math.atan2(y, x);
+                return [φ3 * 180 / Math.PI, λ3 * 180 / Math.PI];
+            }
+
+            let pathPoints = [];
+            const numPoints = 100;
+            for (let i = 0; i <= numPoints; i++) {
+                let fraction = Math.min(i / numPoints, 1);
+                let [interpolatedLat, interpolatedLon] = interpolateGreatCircle(lat1, lon1, lat2, lon2, fraction);
+                let x = (interpolatedLon + 180) / 360 * svgWidth;
+                let y = (90 - interpolatedLat) / 180 * svgHeight;
+                pathPoints.push({ x, y });
+            }
+
+            const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            let d = `M ${pathPoints[0].x},${pathPoints[0].y}`;
+            pathPoints.forEach((point, index) => {
+                if (index > 0) {
+                    d += ` L ${point.x},${point.y}`;
+                }
+            });
+            path.setAttribute('d', d);
+            path.setAttribute('stroke', 'black');
+            path.setAttribute('fill', 'none');
+            path.setAttribute('stroke-width', 0.3);
+            path.setAttribute('stroke-linecap', 'round');
+
+            // Set up the initial dash array (total length of the path)
+            const pathLength = path.getTotalLength();
+            path.style.strokeDasharray = pathLength;
+            path.style.strokeDashoffset = pathLength;
+            path.style.pointerEvents = 'none';
+
+            svg.appendChild(path);
+
+            const airplane = document.createElementNS("http://www.w3.org/2000/svg", "image");
+            airplane.setAttributeNS('http://www.w3.org/1999/xlink', 'href', 'airplane.png');
+            airplane.setAttribute('width', airplaneSize);
+            airplane.setAttribute('height', airplaneSize);
+            airplane.setAttribute('visibility', 'hidden');
+            airplane.style.pointerEvents = 'none';
+            
+            svg.appendChild(airplane);
+
+            // Animate the stroke dash offset to zero
+            let animation = path.animate([
+                { strokeDashoffset: pathLength },
+                { strokeDashoffset: 0 }
+            ], {
+                duration: animationTime,
+                easing: bezierFunction,
+                fill: 'forwards'
+            });
+
+            animation.ready.then(() => {
+                airplane.setAttribute('visibility', 'visible');
+                animateAirplane(airplane, path, animationTime);
+            });
+
+            return { path, animation, airplane };
+        }
+
+        async function deletePath(pathObject, startProgress) {
+            if (!pathObject || !pathObject.path) return;
+
+            // Stop any ongoing animation
+            if (pathObject.animation) {
+                pathObject.animation.cancel();
+            }
+
+            const pathLength = pathObject.path.getTotalLength();
+            const remainingDuration = animationTime * startProgress;
+
+            // Calculate the starting offset based on startProgress
+            const startOffset = pathLength * (1 - startProgress);
+
+            // Animate the path back
+            const reverseAnimation = pathObject.path.animate([
+                { strokeDashoffset: startOffset.toString() },
+                { strokeDashoffset: pathLength.toString() }
+            ], {
+                duration: remainingDuration,
+                easing: bezierFunction,
+                fill: 'forwards'
+            });
+
+            reverseAnimation.onfinish = () => {
+                pathObject.path.remove();
+                if (pathObject.airplane) {
+                    pathObject.airplane.remove();
+                }
+            };
+
+            // Animate the airplane back
+            if (pathObject.airplane) {
+                animateAirplaneReverse(pathObject.airplane, pathObject.path, remainingDuration, startProgress);
+            }
+        }
+
+        function cubicBezier(x1, y1, x2, y2) {
+            return function(t) {
+                // Bezier curve formula
+                function sampleCurveX(t) {
+                    return ((1 - t) * (1 - t) * (1 - t) * 0) +
+                        (3 * (1 - t) * (1 - t) * t * x1) +
+                        (3 * (1 - t) * t * t * x2) +
+                        (t * t * t * 1);
+                }
+
+                function sampleCurveY(t) {
+                    return ((1 - t) * (1 - t) * (1 - t) * 0) +
+                        (3 * (1 - t) * (1 - t) * t * y1) +
+                        (3 * (1 - t) * t * t * y2) +
+                        (t * t * t * 1);
+                }
+
+                function sampleCurveDerivativeX(t) {
+                    return (3 * (1 - t) * (1 - t) * x1) +
+                        (6 * (1 - t) * t * (x2 - x1)) +
+                        (3 * t * t * (1 - x2));
+                }
+
+                // Newton-Raphson iteration to solve for t given x
+                function solveWithGuess(x, guess) {
+                    for (let i = 0; i < 4; ++i) {
+                        let currentX = sampleCurveX(guess);
+                        if (Math.abs(currentX - x) < 0.001) return guess;
+                        let currentSlope = sampleCurveDerivativeX(guess);
+                        if (Math.abs(currentSlope) < 0.000001) break;
+                        guess = guess - (currentX - x) / currentSlope;
+                    }
+                    return guess;
+                }
+
+                // Find t for a given x
+                function solve(x) {
+                    if (x === 0 || x === 1) return x;
+                    let t = x;
+                    return solveWithGuess(x, t);
+                }
+
+                // Use the t found to get y
+                return sampleCurveY(solve(t));
+            };
+        }
+
+        // Add this variable to store the current progress of the airplane
+        let currentAirplaneProgress = 0;
+
+        function animateAirplane(airplane, path, duration) {
+            const pathLength = path.getTotalLength();
+            const start = performance.now();
+
+            function step(timestamp) {
+                const elapsed = timestamp - start;
+                const progress = Math.min(elapsed / duration, 1);
+                const easedProgress = Math.min(easeCubicBezier(progress), 1);
+
+                // Update the current progress
+                currentAirplaneProgress = easedProgress;
+
+                const point = path.getPointAtLength(pathLength * easedProgress);
+
+                // Calculate size
+                let size;
+                if (progress <= 0.5) {
+                    // First half: grow from 0 to airplaneSize
+                    size = sizeCubicBezier(progress) * airplaneSize;
+                } else {
+                    // Second half: shrink from airplaneSize to 0
+                    size = sizeCubicBezier(1 - progress) * airplaneSize;
+                }
+
+                airplane.setAttribute('width', size);
+                airplane.setAttribute('height', size);
+                airplane.setAttribute('x', point.x - size / 2);  // Center the airplane on the path
+                airplane.setAttribute('y', point.y - size / 2);
+
+                // Calculate rotation angle
+                if (progress < 1) {
+                    const nextPoint = path.getPointAtLength(pathLength * Math.min(easeCubicBezier(Math.min(progress + 0.01, 1)), 1));
+                    const angle = Math.atan2(nextPoint.y - point.y, nextPoint.x - point.x) * 180 / Math.PI;
+                    airplane.setAttribute('transform', `rotate(${angle}, ${point.x}, ${point.y})`);
+                }
+
+                if (progress < 1) {
+                    requestAnimationFrame(step);
+                }
+            }
+
+            requestAnimationFrame(step);
+        }
+
+        function animateAirplaneReverse(airplane, path, duration, startProgress) {
+            const pathLength = path.getTotalLength();
+            const start = performance.now();
+            
+            function step(timestamp) {
+                const elapsed = timestamp - start;
+                let progress = Math.min(elapsed / duration, 1);
+                const easedProgress = startProgress - (startProgress * Math.min(easeCubicBezier(progress), 1));
+
+                try {
+                    const point = path.getPointAtLength(pathLength * easedProgress);
+                }
+                catch (error) {
+                    console.error(pathLength * easedProgress);
+                }
+
+                // Calculate size
+                let size;
+                progress += 1 - startProgress;
+                if (progress <= 0.5) {
+                    // First half: grow from 0 to airplaneSize
+                    size = sizeCubicBezier(progress) * airplaneSize;
+                } else {
+                    // Second half: shrink from airplaneSize to 0
+                    size = sizeCubicBezier(1 - progress) * airplaneSize;
+                }
+                airplane.setAttribute('width', size);
+                airplane.setAttribute('height', size);
+                airplane.setAttribute('x', point.x - size / 2);  // Center the airplane on the path
+                airplane.setAttribute('y', point.y - size / 2);
+
+                // Calculate rotation angle
+                if (progress < 1) {
+                    const nextPoint = path.getPointAtLength(pathLength * (startProgress - (startProgress * Math.min(easeCubicBezier(Math.min(progress + 0.01, 1)), 1))));
+                    // Reverse angle calculation for backward movement
+                    const angle = Math.atan2(point.y - nextPoint.y, point.x - nextPoint.x) * 180 / Math.PI + 180;
+                    airplane.setAttribute('transform', `rotate(${angle}, ${point.x}, ${point.y})`);
+                }
+
+                if (progress < 1) {
+                    requestAnimationFrame(step);
+                } else {
+                    airplane.setAttribute('visibility', 'hidden');
+                }
+            }
+
+            requestAnimationFrame(step);
+        }
+        
+        function coordToPixel(lat, lon) {
+            const x = (lon + 180) / 360 * svgWidth;
+            const y = (90 - lat) / 180 * svgHeight;
+            return { x, y };
+        }
+
+        function createMarker(icao, name, lat, lon, group, svg) {
+            const { x, y } = coordToPixel(lat, lon);
+
+            const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            circle.setAttribute('cx', x);
+            circle.setAttribute('cy', y);
+            circle.setAttribute('r', markerRadius);
+            circle.setAttribute('fill', 'black');
+            circle.setAttribute('data-icao', icao);
+            circle.setAttribute('data-name', name)
+
+            let pathObject; // Object to hold the path and its animation state
+            let tooltip;
+
+            circle.addEventListener('mouseenter', async (event) => {
+                pathObject = createPath(depatureLat, departureLon, lat, lon, svg);
+                
+                // Create and position tooltip
+                tooltip = document.createElement('div');
+                tooltip.className = 'marker-tooltip';
+                tooltip.textContent = event.target.getAttribute('data-name');
+                document.body.appendChild(tooltip);
+
+                const svgRect = svg.getBoundingClientRect();
+                const circleRect = circle.getBoundingClientRect();
+
+                tooltip.style.left = `${circleRect.left + circleRect.width / 2 - tooltip.offsetWidth / 2}px`;
+                tooltip.style.top = `${circleRect.top - tooltip.offsetHeight - 5}px`; // Adjusted for caret
+            });
+
+            circle.addEventListener('mouseleave', async () => {
+                deletePath(pathObject, currentAirplaneProgress);
+                currentAirplaneProgress = 0;
+
+                // Hide and remove tooltip
+                if (tooltip) {
+                    tooltip.classList.add('hiding');
+                    tooltip.addEventListener('animationend', () => {
+                        if (tooltip && tooltip.parentNode) {
+                            tooltip.parentNode.removeChild(tooltip);
+                        }
+                        tooltip = null;
+                    }, { once: true });
+                }
+            });
+
+            circle.addEventListener('click', (event) => {
+                if (pathObject && pathObject.path) {
+                    pathObject.path.remove();
+                }
+                if (tooltip) {
+                    tooltip.remove();
+                }
+                depatureLat = lat;
+                departureLon = lon;
+                highlightRoutes(event.target.getAttribute('data-icao'), csvText, svg);
+            });
+
+            group.appendChild(circle);
+        }
+
+        function setupPanZoom() {
+            let isPanning = false;
+            let startPoint = { x: 0, y: 0 };
+            let viewBox = svg.viewBox.baseVal;
+            const originalViewBox = { x: viewBox.x, y: viewBox.y, width: viewBox.width, height: viewBox.height };
+
+            function updateViewBox() {
+                // Bound the viewBox
+                viewBox.x = Math.max(0, Math.min(viewBox.x, originalViewBox.width - viewBox.width));
+                viewBox.y = Math.max(0, Math.min(viewBox.y, originalViewBox.height - viewBox.height));
+
+                svg.setAttribute('viewBox', `${viewBox.x} ${viewBox.y} ${viewBox.width} ${viewBox.height}`);
+            }
+
+            svg.addEventListener('mousedown', (e) => {
+                isPanning = true;
+                startPoint = { x: e.clientX, y: e.clientY };
+            });
+
+            let lastExecution = Date.now();
+            const throttleDuration = 10; // in milliseconds
+
+            svg.addEventListener('mousemove', (e) => {
+                if (!isPanning) return;
+                const now = Date.now();
+                if (now - lastExecution > throttleDuration) {
+                    let dx = (e.clientX - startPoint.x) * (viewBox.width / svg.clientWidth);
+                    let dy = (e.clientY - startPoint.y) * (viewBox.height / svg.clientHeight);
+
+                    viewBox.x -= dx;
+                    viewBox.y -= dy;
+                    updateViewBox();
+                    startPoint = { x: e.clientX, y: e.clientY };
+
+                    lastExecution = now;
+                }
+            });
+
+            svg.addEventListener('mouseup', () => {
+                isPanning = false;
+            });
+
+            svg.addEventListener('mouseleave', () => {
+                isPanning = false;
+            });
+
+            svg.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
+                
+                // Prevent zooming out beyond the original size
+                if (viewBox.width * zoomFactor > originalViewBox.width) {
+                    return;
+                }
+
+                const mouseX = e.clientX - svg.getBoundingClientRect().left;
+                const mouseY = e.clientY - svg.getBoundingClientRect().top;
+
+                const oldWidth = viewBox.width;
+                const oldHeight = viewBox.height;
+                const newWidth = oldWidth * zoomFactor;
+                const newHeight = oldHeight * zoomFactor;
+
+                // Calculate new viewBox coordinates
+                viewBox.x += (mouseX / svg.clientWidth) * (oldWidth - newWidth);
+                viewBox.y += (mouseY / svg.clientHeight) * (oldHeight - newHeight);
+                viewBox.width = newWidth;
+                viewBox.height = newHeight;
+                
+                updateViewBox();
+            });
+
+            updateViewBox(); // Set initial viewBox based on current settings
+        }
+    </script>
+</body>
+</html>
